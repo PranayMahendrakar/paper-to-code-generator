@@ -1,0 +1,223 @@
+# paper_analysis.yml - GitHub Actions Workflow
+# Runs sample paper analyses, generates implementation reports,
+# and publishes documentation to GitHub Pages.
+
+name: Paper Analysis & Documentation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run weekly on Mondays at 08:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      paper_source:
+        description: "arXiv ID, PDF URL, or local path"
+        required: false
+        default: "1706.03762"
+      llm_model:
+        description: "Ollama model name (leave empty for heuristic mode)"
+        required: false
+        default: ""
+
+env:
+  PYTHON_VERSION: "3.11"
+  OUTPUT_DIR: "docs/implementations"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Job 1: Lint and test the pipeline modules
+  # ──────────────────────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pdfplumber PyPDF2 PyYAML torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest pytest-cov flake8
+          pip install -e .
+
+      - name: Lint with flake8
+        run: |
+          flake8 paper2code/ --max-line-length=120 --extend-ignore=E203,W503 --count --statistics
+        continue-on-error: true
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=paper2code --cov-report=xml --cov-report=term-missing
+        continue-on-error: true
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+        continue-on-error: true
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 2: Run sample paper analyses (heuristic mode, no LLM)
+  # ──────────────────────────────────────────────────────────────
+  sample-analysis:
+    name: Sample Paper Analyses
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    strategy:
+      matrix:
+        paper:
+          - id: "1706.03762"
+            name: "attention-is-all-you-need"
+            description: "Transformer (Vaswani et al. 2017)"
+          - id: "1512.03385"
+            name: "deep-residual-learning"
+            description: "ResNet (He et al. 2016)"
+          - id: "1406.2661"
+            name: "generative-adversarial-nets"
+            description: "GAN (Goodfellow et al. 2014)"
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pdfplumber PyPDF2 PyYAML
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Run paper analysis (heuristic mode)
+        run: |
+          python scripts/run_analysis.py \
+            --paper "${{ matrix.paper.id }}" \
+            --output_dir "${{ env.OUTPUT_DIR }}/${{ matrix.paper.name }}" \
+            --no_llm \
+            --report_name "${{ matrix.paper.name }}"
+        continue-on-error: true
+
+      - name: Upload generated implementation
+        uses: actions/upload-artifact@v4
+        with:
+          name: impl-${{ matrix.paper.name }}
+          path: ${{ env.OUTPUT_DIR }}/${{ matrix.paper.name }}/
+          retention-days: 30
+        if: always()
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 3: Manual / workflow_dispatch run
+  # ──────────────────────────────────────────────────────────────
+  custom-analysis:
+    name: Custom Paper Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name == "workflow_dispatch"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install pdfplumber PyPDF2 PyYAML
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Analyse paper
+        run: |
+          python scripts/run_analysis.py \
+            --paper "${{ github.event.inputs.paper_source }}" \
+            --output_dir "custom_output" \
+            --no_llm
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-analysis-result
+          path: custom_output/
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 4: Build and publish GitHub Pages documentation
+  # ──────────────────────────────────────────────────────────────
+  build-docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: sample-analysis
+    if: github.ref == "refs/heads/main"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install doc dependencies
+        run: |
+          pip install mkdocs mkdocs-material mkdocstrings[python] pymdown-extensions
+          pip install pdfplumber PyPDF2 PyYAML
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Download analysis artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: docs/implementations/
+        continue-on-error: true
+
+      - name: Generate documentation index
+        run: python scripts/generate_docs.py
+
+      - name: Build MkDocs site
+        run: mkdocs build --strict --site-dir site/
+        continue-on-error: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+        if: success()
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 5: Deploy to GitHub Pages
+  # ──────────────────────────────────────────────────────────────
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build-docs
+    if: github.ref == "refs/heads/main"
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
